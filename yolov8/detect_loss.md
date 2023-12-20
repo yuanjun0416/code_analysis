@@ -1,3 +1,16 @@
+## loss损失代码讲解
+```python
+统一注释
+a = na = 3wh = h*w = 8400 = 20*20 + 40*40 + 80*80 因为yolov8是free anchor的, 因此, 这个就是num_total_anchor
+batchsize: bs = b = 32
+lhw = 80*80, mwh=40*40, swh=20*20 
+
+n_max_boxes = max_num_obj =22 类似于: max(batch.len(label)) 
+len(label)是batch中每一张图片的label数量, max(batch.len(label))是选择其中的最大值
+```
+
+
+
 ### 标签分配策略
 * TaskAlignedAssigner简介
 
@@ -13,7 +26,10 @@ $$align\\_metric =s^\alpha * u^\beta$$
 
 (3) 对一个预测框与多个真实框匹配测情况进行处理，保留ciou值最大的真实框。
 
-
+* 代码实现流程
+  1. 首先筛选锚点(特征图grid的坐标中心点)落在gt_box中, 得到mask_in_gt((Tensor): shape(b, n_boxes, h*w)), 其中1代表锚点落在gt_box中, 0表示锚点未落在gt_box中
+  2. 构建一个shape为[self.bs, self.n_max_boxes, na]的全0的bbox_scores, 将pd_scores的预测分类分数赋值到对应的bbox_scores中(只赋值mask_in_gt中为1的位置)
+  3. 
 ```python
 
 """
