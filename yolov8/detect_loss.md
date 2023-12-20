@@ -28,8 +28,15 @@ $$align\\_metric =s^\alpha * u^\beta$$
 
 * 代码实现流程
   1. 首先筛选锚点(特征图grid的坐标中心点)落在gt_box中, 得到mask_in_gt((Tensor): shape(b, n_boxes, h*w)), 其中1代表锚点落在gt_box中, 0表示锚点未落在gt_box中
-  2. 构建一个shape为[self.bs, self.n_max_boxes, na]的全0的bbox_scores, 将pd_scores的预测分类分数赋值到对应的bbox_scores中(只赋值mask_in_gt中为1的位置)
-  3. 
+  2. 计算匹配程度
+     
+     得到mask_gt,  mask_gt = mask_in_gt * mask_gt
+     
+     得到bbox_scores, 构建一个shape为[self.bs, self.n_max_boxes, na]的全0的bbox_scores, 将pd_scores的预测分类分数赋值到对应的bbox_scores中(只赋值mask_gt中为1的位置)
+     
+     得到pd_boxes, pd_boxes是[b, n_max_boxes, na, 4][mask_gt] = [N, 4], (原始的pd_bboxes是[b, na, 4], expand之后就是[b, n_max_boxes, na, 4], 这个可以解释成每一个gt对应[b, na, 4])
+
+     得到gt_boxes, gt_bboxes是[b, n_max_boxes, na, 4][mask_gt] = [N, 4], (原始的gt_bboxess是[b, n_max_boxes, 4], expand之后就是[b, n_max_boxes, na, 4], 这个可以解释为每一个grid对应一个[b, n_max_boxes, 4])
 ```python
 
 """
