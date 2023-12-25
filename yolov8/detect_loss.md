@@ -1,4 +1,7 @@
-## loss损失代码讲解
+### yolov8损失代码解析
+#### yolov8版本为`__version__ = '8.0.110'`
+
+* 先验知识
 ```python
 统一注释
 a = na = 3wh = h*w = 8400 = 20*20 + 40*40 + 80*80 因为yolov8是free anchor的, 因此, 这个就是num_total_anchor
@@ -8,288 +11,213 @@ lhw = 80*80, mwh=40*40, swh=20*20
 n_max_boxes = max_num_obj =22 类似于: max(batch.len(label)) 
 len(label)是batch中每一张图片的label数量, max(batch.len(label))是选择其中的最大值
 ```
-
-
-
-### 标签分配策略
-* TaskAlignedAssigner简介
-
-TaskAlignedAssigner 的匹配策略简单总结为：根据分类与回归的分数加权的分数选择正样本。
-
-(1) 计算真实框和预测框的匹配程度。
-
-$$align\\_metric =s^\alpha * u^\beta$$
- 
-其中，s是预测类别分值，u是预测框和真实框的ciou值，$`\alpha`$ 和$`\beta`$为权重超参数，两者相乘就可以衡量匹配程度，当分类的分值越高且ciou越高时，align_metric的值就越接近于1,此时预测框就与真实框越匹配，就越符合正样本的标准。
-
-(2) 对于每个真实框，直接对align_metric匹配程度排序，选取topK个预测框作为正样本。
-
-(3) 对一个预测框与多个真实框匹配测情况进行处理，保留ciou值最大的真实框。
-
-* 代码实现流程
-  1. 首先筛选锚点(特征图grid的坐标中心点)落在gt_box中, 得到mask_in_gt((Tensor): shape(b, n_boxes, h*w)), 其中1代表锚点落在gt_box中, 0表示锚点未落在gt_box中
-  2. 计算匹配程度
-     
-     得到mask_gt,  mask_gt = mask_in_gt * mask_gt
-     
-     得到bbox_scores, 构建一个shape为[self.bs, self.n_max_boxes, na]的全0的bbox_scores, 将pd_scores的预测分类分数赋值到对应的bbox_scores中(只赋值mask_gt中为1的位置)
-     
-     得到pd_boxes, pd_boxes是[b, n_max_boxes, na, 4][mask_gt] = [N, 4], (原始的pd_bboxes是[b, na, 4], expand之后就是[b, n_max_boxes, na, 4], 这个可以解释成每一个gt对应[b, na, 4])
-
-     得到gt_boxes, gt_bboxes是[b, n_max_boxes, na, 4][mask_gt] = [N, 4], (原始的gt_bboxess是[b, n_max_boxes, 4], expand之后就是[b, n_max_boxes, na, 4], 这个可以解释为每一个grid对应一个[b, n_max_boxes, 4])
+损失函数代码讲解
 ```python
+'''
+逻辑：
+1. 将预测的三个特征图合并并进行split, 得到pred_scores(bs, 3hw, 2), pred_distri(bs, 3hw, 64)
+2. 生成anchor_points[3hw, 2]和stride_tensor[3hw, 1]
+3. 生成gt_labels, gt_bboxes, 这两部分其中有0补齐
+4. 将pred_distri转化为xyxy, pred_bboxes(bs, 3hw, 4)
+5. 使用TAL进行正负样本分配, 得到target_bboxes, target_scores(bboxs, scores都是与pred的bboxs, scores一一对应的), fg_mask是最终的正负样本分配结果
+6. 计算cls_loss和boxes_loss
+'''
+# Criterion class for computing training losses
+class Loss:
 
-"""
-这个函数select_candidates_in_gts的目的是在给定一组中心点(anchor centers)和一组ground truth bounding boxes (gt_bboxes)的情况下,
-选择那些与gt_bboxes有重叠的anchor中心, 重叠的意思是anchor的中心点落在了gt_boxes的内部
+    def __init__(self, model):  # model must be de-paralleled
 
-函数的输入参数如下：
-xy_centers(Tensor): 形状为(h*w, 2)的张量, 表示每个anchor box的中心点坐标。每一行包含一个中心点的(x, y, x, y)坐标。
-gt_bboxes(Tensor): 形状为(b, n_boxes, 4)的张量, 表示每个样本的n_boxes个ground truth bounding boxes的坐标。每个bounding box由左上角坐标和右下角坐标组成。
-"""
-def select_candidates_in_gts(xy_centers, gt_bboxes, eps=1e-9):
-    """select the positive anchor center in gt
+        device = next(model.parameters()).device  # get model device
+        h = model.args  # hyperparameters
 
-    Args:
-        xy_centers (Tensor): shape(h*w, 4) 错误 xy_centers的shape应该是(h*w, 2)
-        gt_bboxes (Tensor): shape(b, n_boxes, 4)
-    Return:
-        (Tensor): shape(b, n_boxes, h*w)
-    """
-    n_anchors = xy_centers.shape[0]
-    bs, n_boxes, _ = gt_bboxes.shape
-    # 计算gt_bboxes的左上角坐标(lt)和右下角坐标(rb)。将gt_bboxes重塑为(b*n_boxes, 1, 4), 然后使用chunk(2, 2)将其沿第2维(通道维度)分割成两部分。
-    lt, rb = gt_bboxes.view(-1, 1, 4).chunk(2, 2)  # left-top, right-bottom
-    # 计算每个anchor中心相对于每个ground truth bounding box的偏移量。首先, 将xy_centers添加一个新的维度(维度大小为1)，得到形状为(1, h*w, 4)的张量。
-    # 然后, 分别计算anchor中心与每个ground truth bounding box左上角和右下角坐标的差值, 
-    # 并将这两个差值连接在一起，得到形状为(bs, n_boxes, n_anchors, 4)的张量bbox_deltas。
-    bbox_deltas = torch.cat((xy_centers[None] - lt, rb - xy_centers[None]), dim=2).view(bs, n_boxes, n_anchors, -1)
-    
-    # 对于每个anchor中心和每个ground truth bounding box，计算它们之间的最小距离(在x轴和y轴上)
-    # 这可以通过对bbox_deltas沿第3维(anchor中心维度)求最小值来实现, 结果是一个形状为(bs, n_boxes, h*w)的张量。
-    # 判断这些最小距离是否大于一个很小的阈值eps(默认为1e-9)。如果大于eps，则认为该anchor中心与对应的ground truth bounding box有重叠。
-    # 返回一个形状为(bs, n_boxes, h*w)的张量, 其中值为1表示对应的anchor中心与ground truth bounding box有重叠，值为0表示没有重叠。
-    # return (bbox_deltas.min(3)[0] > eps).to(gt_bboxes.dtype)
-    return bbox_deltas.amin(3).gt_(eps)
+        m = model.model[-1]  # Detect() module
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+        self.hyp = h
+        self.stride = m.stride  # model strides
+        self.nc = m.nc  # number of classes
+        self.no = m.no  # 每一个检测头的输出的[b, n, h, w]中的n: 2(class) + 4(box) * 16(reg_max) = 66
+        self.reg_max = m.reg_max  # dfl reg_max
+        self.device = device
 
+        self.use_dfl = m.reg_max > 1
 
-def select_highest_overlaps(mask_pos, overlaps, n_max_boxes):
-    """if an anchor box is assigned to multiple gts,
-        the one with the highest iou will be selected.
+        self.assigner = TaskAlignedAssigner(topk=10, num_classes=self.nc, alpha=0.5, beta=6.0)
+        self.bbox_loss = BboxLoss(m.reg_max - 1, use_dfl=self.use_dfl).to(device)
+        self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
-    Args:
-        mask_pos (Tensor): shape(b, n_max_boxes, h*w)
-        overlaps (Tensor): shape(b, n_max_boxes, h*w)
-    Return:
-        target_gt_idx (Tensor): shape(b, h*w)
-        fg_mask (Tensor): shape(b, h*w)
-        mask_pos (Tensor): shape(b, n_max_boxes, h*w)
-    """
-    # (b, n_max_boxes, h*w) -> (b, h*w)
-    fg_mask = mask_pos.sum(-2)
-    if fg_mask.max() > 1:  # one anchor is assigned to multiple gt_bboxes
-        mask_multi_gts = (fg_mask.unsqueeze(1) > 1).expand(-1, n_max_boxes, -1)  # (b, n_max_boxes, h*w)
-        max_overlaps_idx = overlaps.argmax(1)  # (b, h*w)
-
-        is_max_overlaps = torch.zeros(mask_pos.shape, dtype=mask_pos.dtype, device=mask_pos.device)
-        is_max_overlaps.scatter_(1, max_overlaps_idx.unsqueeze(1), 1)
-
-        mask_pos = torch.where(mask_multi_gts, is_max_overlaps, mask_pos).float()  # (b, n_max_boxes, h*w)
-        fg_mask = mask_pos.sum(-2)
-    # Find each grid serve which gt(index)
-    target_gt_idx = mask_pos.argmax(-2)  # (b, h*w)
-    return target_gt_idx, fg_mask, mask_pos
-
-
-class TaskAlignedAssigner(nn.Module):
-    """
-    A task-aligned assigner for object detection.
-
-    This class assigns ground-truth (gt) objects to anchors based on the task-aligned metric,
-    which combines both classification and localization information.
-
-    Attributes:
-        topk (int): The number of top candidates to consider.
-        num_classes (int): The number of object classes.
-        alpha (float): The alpha parameter for the classification component of the task-aligned metric.
-        beta (float): The beta parameter for the localization component of the task-aligned metric.
-        eps (float): A small value to prevent division by zero.
-    """
-
-    def __init__(self, topk=13, num_classes=80, alpha=1.0, beta=6.0, eps=1e-9):
-        """Initialize a TaskAlignedAssigner object with customizable hyperparameters."""
-        super().__init__()
-        self.topk = topk  # 每个gt box最多选择topk个候选框作为正样本
-        self.num_classes = num_classes
-        self.bg_idx = num_classes
-        self.alpha = alpha
-        self.beta = beta
-        self.eps = eps
-
-    @torch.no_grad()
-    def forward(self, pd_scores, pd_bboxes, anc_points, gt_labels, gt_bboxes, mask_gt):
+    def preprocess(self, targets, batch_size, scale_tensor):
         """
-        Compute the task-aligned assignment.
-        Reference https://github.com/Nioolek/PPYOLOE_pytorch/blob/master/ppyoloe/assigner/tal_assigner.py
-
+        这个函数的作用是输出一个tensor, 这个tensor由targets和zeros组成
+        counts是Batch中每一张图片的labels数量, 选择其中最大的数量生成一个out, 其shape为[Batch, max_labels, 5]的全零tensor
+        将targets中对应图片的labels(cls, xyxy)复制到out[..., :5]中, out[..., 0]为cls, out[..., 1:5]为xyxy
+        targets中有小于max_labels数量的, 即out[B, len(targets):, 5]全都为0
         Args:
-            pd_scores (Tensor): shape(bs, num_total_anchors, num_classes)
-            pd_bboxes (Tensor): shape(bs, num_total_anchors, 4)
-            anc_points (Tensor): shape(num_total_anchors, 2)  这里的anc_points已经是映射到原始图片上的坐标中心点了
-            gt_labels (Tensor): shape(bs, n_max_boxes, 1)
-            gt_bboxes (Tensor): shape(bs, n_max_boxes, 4)
-            mask_gt (Tensor): shape(bs, n_max_boxes, 1)
-
-        Returns:
-            target_labels (Tensor): shape(bs, num_total_anchors)
-            target_bboxes (Tensor): shape(bs, num_total_anchors, 4)
-            target_scores (Tensor): shape(bs, num_total_anchors, num_classes)
-            fg_mask (Tensor): shape(bs, num_total_anchors)
-            target_gt_idx (Tensor): shape(bs, num_total_anchors)
+            targets: torch.Size([na, 6])
+            batch_size: int
+            scale_tensor: tensor([640, 640, 640, 640])
+        return:
+            out: torch.Size([Batch, max_labels, 5])
         """
-        self.bs = pd_scores.size(0)
-        self.n_max_boxes = gt_bboxes.size(1)
+        """Preprocesses the target counts and matches with the input batch size to output a tensor."""
+        if targets.shape[0] == 0:
+            out = torch.zeros(batch_size, 0, 5, device=self.device)
+        else:
+            i = targets[:, 0]  # image index
+            _, counts = i.unique(return_counts=True)  # 图片索引出现的次数  torch.Size([32])
+            counts = counts.to(dtype=torch.int32)
+            out = torch.zeros(batch_size, counts.max(), 5, device=self.device)
+            for j in range(batch_size):
+                matches = i == j
+                n = matches.sum()
+                if n:
+                    # 将targets中对应图片的labels(cls, xyxy)复制到out[..., :5]中, out[..., 0]为cls, out[..., 1:5]为xyxy
+                    # j是对应的图片, n是该图片的label数量, out[j, n:]全部是0
+                    out[j, :n] = targets[matches, 1:]
+            # scale_tensor: [640, 640, 640, 640]
+            # mul_是将out[..., 1:5]中的值逐元素的乘以scale_tensor
+            out[..., 1:5] = xywh2xyxy(out[..., 1:5].mul_(scale_tensor))
+        return out
 
-        # 如果不存在真实框, 直接返回结果
-        if self.n_max_boxes == 0:
-            device = gt_bboxes.device
-            return (torch.full_like(pd_scores[..., 0], self.bg_idx).to(device), torch.zeros_like(pd_bboxes).to(device),
-                    torch.zeros_like(pd_scores).to(device), torch.zeros_like(pd_scores[..., 0]).to(device),
-                    torch.zeros_like(pd_scores[..., 0]).to(device))
+
+    def bbox_decode(self, anchor_points, pred_dist):
+        # 这个bbox_decode函数的目的是从预测的物体边界框坐标分布（pred_dist）和参考点（anchor_points）解码出实际的边界框坐标xyxy。
+        """Decode predicted object bounding box coordinates from anchor points and distribution."""
+        if self.use_dfl:
+            b, a, c = pred_dist.shape  # batch, anchors, channels
+            # pred_dist在matmul之前, shape为[b, a, 4, 16], self.proj的shape为[16], 最终的pred_dist的shape为[b, a, 4]
+            # 如果不理解可以直接使用 a = torch.ones((1, 3, 4, 16)), 与b=torch.rand(16)进行matmul
+            pred_dist = pred_dist.view(b, a, 4, c // 4).softmax(3).matmul(self.proj.type(pred_dist.dtype))
+            # pred_dist = pred_dist.view(b, a, c // 4, 4).transpose(2,3).softmax(3).matmul(self.proj.type(pred_dist.dtype))
+            # pred_dist = (pred_dist.view(b, a, c // 4, 4).softmax(2) * self.proj.type(pred_dist.dtype).view(1, 1, -1, 1)).sum(2)
+        return dist2bbox(pred_dist, anchor_points, xywh=False)
+
+
+    # 假设检测是二分类['flame','smoke']
+    # datasets如果使用了moasic技术的话, 那么batch_idx的label数量就对不上这个im_file中的图片上的label数量
+    # list((32, ))表示列表, (32, )类似shape
+    # stride: 是检测头输出的特征图相对于模型输入图片的缩小倍数
+    def __call__(self, preds, batch):
+        """
+        Args:
+            preds: [tensor(Size([32, 66, 80, 80])), tensor(Size([32, 66, 40, 40])), tensor(Size([32, 66, 20, 20]))]
+            bacth: {'im_file': list((32, )), 'ori_shape': list((32, )), 'resized_shape': list((32, )), 
+                    'img': tensor(Size[32, 3, 640, 640]), 'cls': tensor(Size[211, 1]), 'bboxes': tensor(Size[211, 4]), 'batch_idx': Size[211]}
+        """
+
+        """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
+        loss = torch.zeros(3, device=self.device)  # box, cls, dfl
+        feats = preds[1] if isinstance(preds, tuple) else preds  # preds是列表, feats=preds
+        # feats[0].shape[0]: bs  self.no: 66
+        # xi: tensor(Size[bs, 66, w*h]]) h, w对应的三个检测头的特征图的大小分别为20, 40, 80(大目标, 中目标, 小目标)
+        # pred_distri: tensor(Size[bs, 64, 8400])  pred_scores: tensor(Size[bs, 2, 8400])
+        # pred_distri表示的是边界框的距离, 将来会decode为边界框坐标, pred_scores表示的是边界框的分类分数
+        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
+            (self.reg_max * 4, self.nc), 1)
+
+        pred_scores = pred_scores.permute(0, 2, 1).contiguous()  # (bs, 3hw, 2)
+        pred_distri = pred_distri.permute(0, 2, 1).contiguous()  # (bs, 3hw, 64)
+
+        dtype = pred_scores.dtype  # dtype: torch.float16
+        batch_size = pred_scores.shape[0]  # batch_size: 32
+        imgsz = torch.tensor(feats[0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]  # image size (h,w) imgsz: [640, 640]
         
-        # 真实框的mask，正负样本的匹配程度，正负样本的IoU值
-        mask_pos, align_metric, overlaps = self.get_pos_mask(pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points,
-                                                             mask_gt)
+        # anchor_point: torch.Size([8400, 2])
+        # anchor_point代表的是三个特征图80*80, 40*40, 20*20的anchor的中心点坐标
+        # stride_tensor: torch.Size([8400, 1])
+        # 中心点坐标对应的stride
+        anchor_points, stride_tensor = make_anchors(feats, self.stride, 0.5)
 
-        target_gt_idx, fg_mask, mask_pos = select_highest_overlaps(mask_pos, overlaps, self.n_max_boxes)
+        # targets
+        # targets: shape[na, 6] 这里的na表示的是32张图片mosaic后的总的label数量, 6表示的是(batch_idx, cls, xyxy)
+        targets = torch.cat((batch['batch_idx'].view(-1, 1), batch['cls'].view(-1, 1), batch['bboxes']), 1)
+        # targets: torch.Size([bs, n_max_boxes, 5])
+        # 这里的22就是32张图片中的最大label数量
+        targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
+        # gt_labels: torch.Size([bs, n_max_boxes, 1]), gt_bboxes: torch.Size([bs, n_max_boxes, 4])
+        gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
 
-        # Assigned target
-        target_labels, target_bboxes, target_scores = self.get_targets(gt_labels, gt_bboxes, target_gt_idx, fg_mask)
+        # mask_gt: torch.Size([bs, n_max_boxes, 1])
+        # 这个是用来判断是否有gt的, 先将xyxy的所有值求和, gt_(0)是大于0的置1, 否则置0
+        mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0)
 
-        # Normalize
-        align_metric *= mask_pos
-        pos_align_metrics = align_metric.amax(axis=-1, keepdim=True)  # b, max_num_obj
-        pos_overlaps = (overlaps * mask_pos).amax(axis=-1, keepdim=True)  # b, max_num_obj
-        norm_align_metric = (align_metric * pos_overlaps / (pos_align_metrics + self.eps)).amax(-2).unsqueeze(-1)
-        target_scores = target_scores * norm_align_metric
+        # pboxes
+        # 将pred_distri解码为边界框坐标, pred_bboxes: torch.Size([bs, a, 4])
+        pred_bboxes = self.bbox_decode(anchor_points, pred_distri)  # xyxy, (bs, h*w, 4)
 
-        return target_labels, target_bboxes, target_scores, fg_mask.bool(), target_gt_idx
+        # fg_mask: torch.Size([bs, h*w])
+        # 值为True的正样本, 为False的是负样本
+        # target_bboxes: torch.Size([bs, h*w, 4]) 与pred_bboxes的shape 一一对应
+        # 这个target_bboxes: h*w中还有负样本, 负样本不参与bbox计算, 在后续会进行处理
+        # target_scores(shape(bs, h*w, num_class))
+        # 负样本的num_class的值全为0
+        # 举个例子, bs=1, h*w=2, num_class=2  target_scores: tensor([[0, 0], [0, 1]])(当然这个1可能是个小数)
+        # [0, 0]对应的pd0是负样本, [0, 1]对应的pd1是正样本，对应的是gt1, 即假如是二分类{'0':flame, '1':smoke}对应的是'1':smoke
+        _, target_bboxes, target_scores, fg_mask, _ = self.assigner(
+            pred_scores.detach().sigmoid(), (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+            anchor_points * stride_tensor, gt_labels, gt_bboxes, mask_gt)
 
-    def get_pos_mask(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, anc_points, mask_gt):
-        """Get in_gts mask, (b, max_num_obj, h*w)."""
-        # 预测框和真实框的匹配程度、预测框和真实框的IoU值
-        mask_in_gts = select_candidates_in_gts(anc_points, gt_bboxes)
-        # Get anchor_align metric, (b, max_num_obj, h*w)
-        align_metric, overlaps = self.get_box_metrics(pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_in_gts * mask_gt)
-        # Get topk_metric mask, (b, max_num_obj, h*w)
-        mask_topk = self.select_topk_candidates(align_metric, topk_mask=mask_gt.expand(-1, -1, self.topk).bool())
-        # Merge all mask to a final mask, (b, max_num_obj, h*w)
-        mask_pos = mask_topk * mask_in_gts * mask_gt
+        # 在分类损失求平均的时候使用
+        # target_scores_sum: tensor(734.898, device='cuda:0')
+        # 这里求和有小数的原因是在正负样本分配的最后target_scores乘以了一个动态权重
+        target_scores_sum = max(target_scores.sum(), 1)
 
-        return mask_pos, align_metric, overlaps
+        # cls loss
+        # loss[1] = self.varifocal_loss(pred_scores, target_scores, target_labels) / target_scores_sum  # VFL way
+        # bceloss, 正负样本都参加分类损失的计算
+        # 计算方式详情可以看https://blog.csdn.net/shilichangtin/article/details/135185583
+        # 除以target_scores_sum就是为了求平均
+        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
 
-    def get_box_metrics(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_gt):
-        """Compute alignment metric given predicted and ground truth bounding boxes."""
-        na = pd_bboxes.shape[-2]
-        mask_gt = mask_gt.bool()  # b, max_num_obj, h*w
-        overlaps = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_bboxes.dtype, device=pd_bboxes.device)
-        bbox_scores = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_scores.dtype, device=pd_scores.device)
+        # bbox loss
+        # 只有正样本参加bbox损失计算
+        if fg_mask.sum():
+            target_bboxes /= stride_tensor
+            loss[0], loss[2] = self.bbox_loss(pred_distri, pred_bboxes, anchor_points, target_bboxes, target_scores,
+                                              target_scores_sum, fg_mask)
 
-        ind = torch.zeros([2, self.bs, self.n_max_boxes], dtype=torch.long)  # 2, b, max_num_obj
-        ind[0] = torch.arange(end=self.bs).view(-1, 1).expand(-1, self.n_max_boxes)  # b, max_num_obj
-        ind[1] = gt_labels.squeeze(-1)  # b, max_num_obj
-        # Get the scores of each grid for each gt cls
-        bbox_scores[mask_gt] = pd_scores[ind[0], :, ind[1]][mask_gt]  # b, max_num_obj, h*w
+        loss[0] *= self.hyp.box  # box gain
+        loss[1] *= self.hyp.cls  # cls gain
+        loss[2] *= self.hyp.dfl  # dfl gain
 
-        # (b, max_num_obj, 1, 4), (b, 1, h*w, 4)
-        pd_boxes = pd_bboxes.unsqueeze(1).expand(-1, self.n_max_boxes, -1, -1)[mask_gt]
-        gt_boxes = gt_bboxes.unsqueeze(2).expand(-1, -1, na, -1)[mask_gt]
-        overlaps[mask_gt] = bbox_iou(gt_boxes, pd_boxes, xywh=False, CIoU=True).squeeze(-1).clamp_(0)
+        return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
+```
 
-        align_metric = bbox_scores.pow(self.alpha) * overlaps.pow(self.beta)
-        return align_metric, overlaps
+* bbox损失
+```python
+class BboxLoss(nn.Module):
 
-    def select_topk_candidates(self, metrics, largest=True, topk_mask=None):
-        """
-        Select the top-k candidates based on the given metrics.
+    def __init__(self, reg_max, use_dfl=False):
+        """Initialize the BboxLoss module with regularization maximum and DFL settings."""
+        super().__init__()
+        self.reg_max = reg_max
+        self.use_dfl = use_dfl
 
-        Args:
-            metrics (Tensor): A tensor of shape (b, max_num_obj, h*w), where b is the batch size,
-                              max_num_obj is the maximum number of objects, and h*w represents the
-                              total number of anchor points.
-            largest (bool): If True, select the largest values; otherwise, select the smallest values.
-            topk_mask (Tensor): An optional boolean tensor of shape (b, max_num_obj, topk), where
-                                topk is the number of top candidates to consider. If not provided,
-                                the top-k values are automatically computed based on the given metrics.
+    def forward(self, pred_dist, pred_bboxes, anchor_points, target_bboxes, target_scores, target_scores_sum, fg_mask):
+        """IoU loss."""
+        # weight: torch.Size([1700, 1])
+        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+        # iou: torch.Size([1700, 1])
+        # 这个就是只有正阳本参与box计算
+        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+        # 这个类似于分类损失求平均, 再次提醒 target_scores中的值可能是小数, 因此weight也是小数
+        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
 
-        Returns:
-            (Tensor): A tensor of shape (b, max_num_obj, h*w) containing the selected top-k candidates.
-        """
+        # DFL loss
+        # DFL loss论文没看, 现不做解读, 后续补充
+        if self.use_dfl:
+            target_ltrb = bbox2dist(anchor_points, target_bboxes, self.reg_max)
+            loss_dfl = self._df_loss(pred_dist[fg_mask].view(-1, self.reg_max + 1), target_ltrb[fg_mask]) * weight
+            loss_dfl = loss_dfl.sum() / target_scores_sum
+        else:
+            loss_dfl = torch.tensor(0.0).to(pred_dist.device)
 
-        # (b, max_num_obj, topk)
-        topk_metrics, topk_idxs = torch.topk(metrics, self.topk, dim=-1, largest=largest)
-        if topk_mask is None:
-            topk_mask = (topk_metrics.max(-1, keepdim=True)[0] > self.eps).expand_as(topk_idxs)
-        # (b, max_num_obj, topk)
-        topk_idxs.masked_fill_(~topk_mask, 0)
-
-        # (b, max_num_obj, topk, h*w) -> (b, max_num_obj, h*w)
-        count_tensor = torch.zeros(metrics.shape, dtype=torch.int8, device=topk_idxs.device)
-        ones = torch.ones_like(topk_idxs[:, :, :1], dtype=torch.int8, device=topk_idxs.device)
-        for k in range(self.topk):
-            # Expand topk_idxs for each value of k and add 1 at the specified positions
-            count_tensor.scatter_add_(-1, topk_idxs[:, :, k:k + 1], ones)
-        # count_tensor.scatter_add_(-1, topk_idxs, torch.ones_like(topk_idxs, dtype=torch.int8, device=topk_idxs.device))
-        # filter invalid bboxes
-        count_tensor.masked_fill_(count_tensor > 1, 0)
-
-        return count_tensor.to(metrics.dtype)
-
-    def get_targets(self, gt_labels, gt_bboxes, target_gt_idx, fg_mask):
-        """
-        Compute target labels, target bounding boxes, and target scores for the positive anchor points.
-
-        Args:
-            gt_labels (Tensor): Ground truth labels of shape (b, max_num_obj, 1), where b is the
-                                batch size and max_num_obj is the maximum number of objects.
-            gt_bboxes (Tensor): Ground truth bounding boxes of shape (b, max_num_obj, 4).
-            target_gt_idx (Tensor): Indices of the assigned ground truth objects for positive
-                                    anchor points, with shape (b, h*w), where h*w is the total
-                                    number of anchor points.
-            fg_mask (Tensor): A boolean tensor of shape (b, h*w) indicating the positive
-                              (foreground) anchor points.
-
-        Returns:
-            (Tuple[Tensor, Tensor, Tensor]): A tuple containing the following tensors:
-                - target_labels (Tensor): Shape (b, h*w), containing the target labels for
-                                          positive anchor points.
-                - target_bboxes (Tensor): Shape (b, h*w, 4), containing the target bounding boxes
-                                          for positive anchor points.
-                - target_scores (Tensor): Shape (b, h*w, num_classes), containing the target scores
-                                          for positive anchor points, where num_classes is the number
-                                          of object classes.
-        """
-
-        # Assigned target labels, (b, 1)
-        batch_ind = torch.arange(end=self.bs, dtype=torch.int64, device=gt_labels.device)[..., None]
-        target_gt_idx = target_gt_idx + batch_ind * self.n_max_boxes  # (b, h*w)
-        target_labels = gt_labels.long().flatten()[target_gt_idx]  # (b, h*w)
-
-        # Assigned target boxes, (b, max_num_obj, 4) -> (b, h*w)
-        target_bboxes = gt_bboxes.view(-1, 4)[target_gt_idx]
-
-        # Assigned target scores
-        target_labels.clamp_(0)
-
-        # 10x faster than F.one_hot()
-        target_scores = torch.zeros((target_labels.shape[0], target_labels.shape[1], self.num_classes),
-                                    dtype=torch.int64,
-                                    device=target_labels.device)  # (b, h*w, 80)
-        target_scores.scatter_(2, target_labels.unsqueeze(-1), 1)
-
-        fg_scores_mask = fg_mask[:, :, None].repeat(1, 1, self.num_classes)  # (b, h*w, 80)
-        target_scores = torch.where(fg_scores_mask > 0, target_scores, 0)
-
-        return target_labels, target_bboxes, target_scores
+        return loss_iou, loss_dfl
 
 ```
+#### 1.为什么使用target_scores_sum
+以往的yolov5在BCELoss的使用`BCEcls = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h['cls_pw']], device=device))`，默认使用的是`reduction='mean'`,这代表求完损失之后是直接求平均的。
+
+在yolov8检测Loss初始化的时候, 使用的代码是`self.bce = nn.BCEWithLogitsLoss(reduction='none')`，这个`reduction='none`的使用方法可以参考[我的torch.nn.BCEWithLogitsLoss用法介绍博客](https://blog.csdn.net/shilichangtin/article/details/135185583?spm=1001.2014.3001.5502)， 因此需要进行平均，这个平均的方法是除以target_scores_sum(当然这个平均的分母中只有正样本进行参与，负样本的全是0，求和相当于直接排除负样本了, 而`self.bce(pred_scores, target_scores.to(dtype))`是正负样本都有值，因此求`sum()`的时候正负样本都参与了，似乎是不公平的？这个还是不是特别理解, yolov5计算的时候使用的是`reduction='mean'`是直接除以总数)
+
+后续的box_loss计算也用上了这个target_scores_sum和target_score，作用也是求平均，与cls_loss类似(box_loss计算时候只有正样本参与计算损失, 因此不存在上面的这个疑惑)
+
